@@ -28,6 +28,18 @@ service-evidence response.
   case and result the §5 table quotes against those vectors
   (`test/interop/answer/testdata/`, pinned by digest).
 
+### Added: `BundleRequest.ProducerSignatures`
+
+A bundle can carry each record's stored Producer Envelope inline, in the form
+AAC bundle verifiers check: `signature` (the envelope, hex) and `key_id` (the
+key it verifies under, hex). The envelope is the one the book stored when it
+sealed the record; nothing is re-signed. A record whose stored envelope is
+missing or does not verify over its record id, or whose stored capsule does not
+recompute to that id, refuses the bundle with `ErrCorrupt`, before any
+disclosure record is committed. Both members sit outside the capsule_id
+preimage and inside the bundle digest the disclosure record commits to. Off by
+default: a bundle that does not ask is unchanged.
+
 ### Added: the Rust `evidencebook` crate
 
 The Rust implementation moved here from checkpointed-local-log with its

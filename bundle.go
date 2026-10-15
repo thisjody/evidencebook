@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	aacbundle "github.com/action-state-group/agent-action-capsule/go/bundle"
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	"github.com/action-state-group/agent-action-capsule/go/disclosure"
+	"github.com/action-state-group/agent-action-capsule/go/envelope"
 )
 
 // PayloadsMode is the disclosure record's payloads claim.
@@ -62,6 +64,16 @@ type BundleRequest struct {
 	// At pins the coverage anchor; nil checkpoints the book now.
 	At         *Checkpoint
 	Extensions map[string]json.RawMessage
+	// ProducerSignatures carries every record's stored Producer Envelope
+	// inline, in the form AAC bundle verifiers check: signature, the
+	// envelope as hex, and key_id, the signer's raw public key as hex
+	// (KeyID's convention), read from the envelope once it verifies over the
+	// record id. Both sit outside the capsule_id preimage and inside the
+	// bundle digest the disclosure record commits to. Nothing is re-signed:
+	// a record without a stored envelope, whose envelope does not verify, or
+	// whose stored capsule does not recompute to its id refuses the bundle
+	// with ErrCorrupt.
+	ProducerSignatures bool
 }
 
 // Bundle is a portable, self-verifying Evidence Bundle v2 plus the disclosure
@@ -203,7 +215,13 @@ func (b *Book) bundleLocked(ctx context.Context, req BundleRequest) (Bundle, err
 		if err != nil {
 			return Bundle{}, err
 		}
-		wire.Records = append(wire.Records, stored.Capsule)
+		capsule := stored.Capsule
+		if req.ProducerSignatures {
+			if capsule, err = signedCapsule(id, stored); err != nil {
+				return Bundle{}, err
+			}
+		}
+		wire.Records = append(wire.Records, capsule)
 		if !slices.Contains(disclosed, id) {
 			statement.Withheld = append(statement.Withheld, WithheldItem{RecordID: id, Member: HeaderMember, Digest: digestBytes(stored.Header)})
 		}
@@ -274,6 +292,42 @@ func (b *Book) bundleLocked(ctx context.Context, req BundleRequest) (Bundle, err
 		return Bundle{}, err
 	}
 	return Bundle{JSON: data, Digest: statement.BundleDigest, Anchor: anchor, Disclosure: record}, nil
+}
+
+// signedCapsule is a stored record's capsule with its Producer Envelope
+// inline (see BundleRequest.ProducerSignatures). The envelope is the one the
+// book stored when it sealed the record; it must verify over the record id,
+// and key_id is the key it verifies under.
+func signedCapsule(id string, stored StoredRecord) (json.RawMessage, error) {
+	if stored.RecordID != id {
+		return nil, fmt.Errorf("%w: record %s: store returned record %s", ErrCorrupt, id, stored.RecordID)
+	}
+	if len(stored.Envelope) == 0 {
+		return nil, fmt.Errorf("%w: record %s has no stored Producer Envelope", ErrCorrupt, id)
+	}
+	verified := envelope.Verify(id, stored.Envelope)
+	if !verified.OK || len(verified.PublicKey) == 0 {
+		return nil, fmt.Errorf("%w: record %s: stored Producer Envelope does not verify over its record id", ErrCorrupt, id)
+	}
+	decoded, err := decodeJSON(stored.Capsule)
+	if err != nil {
+		return nil, fmt.Errorf("%w: record %s: stored capsule: %v", ErrCorrupt, id, err)
+	}
+	capsule, ok := decoded.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: record %s: stored capsule is not a JSON object", ErrCorrupt, id)
+	}
+	for _, member := range []string{"signature", "key_id"} {
+		if _, present := capsule[member]; present {
+			return nil, fmt.Errorf("%w: record %s: stored capsule already carries %s", ErrCorrupt, id, member)
+		}
+	}
+	if recomputed, err := canonical.ComputeCapsuleID(capsule); err != nil || recomputed != id {
+		return nil, fmt.Errorf("%w: record %s: stored capsule does not recompute to its record id", ErrCorrupt, id)
+	}
+	capsule["signature"] = hex.EncodeToString(stored.Envelope)
+	capsule["key_id"] = hex.EncodeToString(verified.PublicKey)
+	return json.Marshal(capsule)
 }
 
 // closureLocked walks links from root up to depth hops. Targets the book does
